@@ -169,7 +169,7 @@ class _CodeInputController extends ChangeNotifier implements DeltaTextInputClien
           newValue == afterNewLine &&
           newValue.selection.isCollapsed &&
           newValue.selection.extentOffset == beforeNewLine.selection.extentOffset + 1 &&
-          !newValue.composing.isValid;
+          (!newValue.composing.isValid || newValue.composing.isCollapsed);
       _applyingDeltaBatch = true;
       try {
         if (enter) {
