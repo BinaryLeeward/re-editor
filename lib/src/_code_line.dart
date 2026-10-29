@@ -201,17 +201,7 @@ class _CodeLineEditingControllerImpl extends ValueNotifier<CodeLineEditingValue>
   @override
   void edit(TextEditingValue newValue) {
     if (newValue.text.isMultiline) {
-      final String replacement;
-      final String beforeText = _codeTextBefore(selection.start);
-      final String endText = _codeTextAfter(selection.end);
-      if (beforeText.isNotEmpty && !newValue.text.startsWith(beforeText)) {
-        replacement = newValue.text;
-      } else if (endText.isNotEmpty && !newValue.text.endsWith(endText)) {
-        replacement = newValue.text;
-      } else {
-        replacement = newValue.text.substring(beforeText.length, newValue.text.length - endText.length);
-      }
-      _replaceRange(replacement);
+      _editMultiline(newValue);
       return;
     }
     final CodeLines newCodeLines;
@@ -272,6 +262,59 @@ class _CodeLineEditingControllerImpl extends ValueNotifier<CodeLineEditingValue>
       composing: newComposing
     );
     _cache.markNewRecord(false);
+    makeCursorCenterIfInvisible();
+  }
+
+  void _editMultiline(TextEditingValue newValue) {
+    // The native client exposes the base line, not just the selected text.
+    // Replace the affected lines in full so a same-batch correction before
+    // the caret is not duplicated. Retain unselected cross-line boundaries.
+    final String prefix = !selection.isSameLine && selection.baseIndex > selection.extentIndex
+        ? _codeTextBefore(selection.start) : '';
+    final String suffix = !selection.isSameLine && selection.baseIndex < selection.extentIndex
+        ? _codeTextAfter(selection.end) : '';
+    final List<String> lines = ('$prefix${newValue.text}$suffix').textLines;
+    final CodeLines newCodeLines = codeLines.sublines(0, selection.startIndex);
+    for (int i = 0; i < lines.length; i++) {
+      newCodeLines.add(i == lines.length - 1
+          ? endLine.copyWith(text: lines[i]) : CodeLine(lines[i]));
+    }
+    if (selection.endIndex + 1 < codeLines.length) {
+      newCodeLines.addFrom(codeLines, selection.endIndex + 1);
+    }
+
+    CodeLinePosition position(int offset) {
+      final List<String> before = newValue.text.substring(0, offset).textLines;
+      return CodeLinePosition(
+        index: selection.startIndex + before.length - 1,
+        offset: before.last.length + (before.length == 1 ? prefix.length : 0),
+        affinity: newValue.selection.affinity,
+      );
+    }
+
+    final CodeLinePosition base = position(newValue.selection.baseOffset);
+    final CodeLinePosition extent = position(newValue.selection.extentOffset);
+    TextRange newComposing = TextRange.empty;
+    if (newValue.composing.isValid) {
+      final CodeLinePosition start = position(newValue.composing.start);
+      final CodeLinePosition end = position(newValue.composing.end);
+      // Composing ranges in this controller are local to the base line.
+      if (start.index == base.index && end.index == base.index) {
+        newComposing = TextRange(start: start.offset, end: end.offset);
+      }
+    }
+    value = CodeLineEditingValue(
+      codeLines: newCodeLines,
+      selection: CodeLineSelection(
+        baseIndex: base.index,
+        baseOffset: base.offset,
+        extentIndex: extent.index,
+        extentOffset: extent.offset,
+        baseAffinity: base.affinity,
+        extentAffinity: extent.affinity,
+      ),
+      composing: newComposing,
+    );
     makeCursorCenterIfInvisible();
   }
 

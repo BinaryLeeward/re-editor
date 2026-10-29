@@ -7,6 +7,7 @@ class _CodeInputController extends ChangeNotifier implements DeltaTextInputClien
   bool _readOnly;
   bool _autocompleteSymbols;
   bool _updateCausedByFloatingCursor;
+  bool _applyingDeltaBatch = false;
   late Offset _floatingCursorStartingOffset;
 
   TextInputConnection? _textInputConnection;
@@ -141,12 +142,51 @@ class _CodeInputController extends ChangeNotifier implements DeltaTextInputClien
     }
 
     if (textEditingDeltas.any((delta) => delta is TextEditingDeltaInsertion && delta.textInserted == '\n')) {
-      TextEditingValue newValue = _remoteEditingValue!;
+      final TextEditingValue previousValue = _remoteEditingValue!;
+      TextEditingValue newValue = previousValue;
+      TextEditingValue? beforeNewLine;
+      TextEditingValue? afterNewLine;
+      bool newLineAtCaret = false;
       for (final TextEditingDelta delta in textEditingDeltas) {
+        if (delta is TextEditingDeltaInsertion && delta.textInserted == '\n') {
+          beforeNewLine = newValue;
+          afterNewLine = delta.apply(newValue);
+          newLineAtCaret = delta.insertionOffset == newValue.selection.extentOffset;
+        }
         newValue = delta.apply(newValue);
       }
       _remoteEditingValue = newValue;
-      _controller.applyNewLine();
+
+      // Only an isolated Enter at the current caret may add indentation. A
+      // batch can also commit an IME candidate, move the selection, or edit
+      // text after a newline; preserve complex batches as literal updates.
+      final bool enter = beforeNewLine != null &&
+          newLineAtCaret &&
+          !beforeNewLine.text.isMultiline &&
+          beforeNewLine.selection.isCollapsed &&
+          (!beforeNewLine.composing.isValid || beforeNewLine.composing.isCollapsed) &&
+          _controller.selection.isCollapsed &&
+          newValue == afterNewLine &&
+          newValue.selection.isCollapsed &&
+          newValue.selection.extentOffset == beforeNewLine.selection.extentOffset + 1 &&
+          !newValue.composing.isValid;
+      _applyingDeltaBatch = true;
+      try {
+        if (enter) {
+          if (beforeNewLine != previousValue || beforeNewLine.composing.isValid) {
+            _controller.edit(beforeNewLine.copyWith(composing: TextRange.empty).removePrefixIfNecessary());
+          }
+          _controller.applyNewLine();
+        } else {
+          _controller.edit(newValue.removePrefixIfNecessary());
+        }
+      } finally {
+        _applyingDeltaBatch = false;
+        // Publish the final line-local state once, including any indentation
+        // introduced by the controller, rather than intermediate batch values.
+        _onCodeEditingChanged();
+      }
+      notifyListeners();
       return;
     }
 
@@ -349,6 +389,9 @@ class _CodeInputController extends ChangeNotifier implements DeltaTextInputClien
   bool get _hasInputConnection => _textInputConnection?.attached ?? false;
 
   void _onCodeEditingChanged() {
+    if (_applyingDeltaBatch) {
+      return;
+    }
     _updateRemoteEditingValueIfNeeded();
     _updateRemoteComposingIfNeeded();
   }
