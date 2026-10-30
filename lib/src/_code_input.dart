@@ -142,6 +142,10 @@ class _CodeInputController extends ChangeNotifier implements DeltaTextInputClien
     }
 
     if (textEditingDeltas.any((delta) => delta is TextEditingDeltaInsertion && delta.textInserted == '\n')) {
+      if (_remoteEditingValue!.usePrefix && textEditingDeltas.any(_removesGuard)) {
+        _applyGuardedDeltaBatch(textEditingDeltas);
+        return;
+      }
       final TextEditingValue previousValue = _remoteEditingValue!;
       TextEditingValue newValue = previousValue;
       TextEditingValue? beforeNewLine;
@@ -224,6 +228,156 @@ class _CodeInputController extends ChangeNotifier implements DeltaTextInputClien
     }
     notifyListeners();
     // _Trace.end('updateEditingValue all');
+  }
+
+  bool _removesGuard(TextEditingDelta delta) =>
+      delta is TextEditingDeltaDeletion &&
+      delta.oldText.startsWith(_kPrefix) &&
+      delta.deletedRange == const TextRange(start: 0, end: 1);
+
+  void _applyGuardedDeltaBatch(List<TextEditingDelta> deltas) {
+    TextEditingValue nativeValue = _remoteEditingValue!;
+    int nativeCaret = nativeValue.selection.extentOffset;
+    final TextEditingValue finalNativeValue = deltas.fold(nativeValue,
+        (value, delta) => delta.apply(value));
+
+    // Commands may remove a line or expand it into several lines. Anchor each
+    // native offset at the controller's current caret instead of assuming the
+    // native and document line counts still agree. The leading guard occupies
+    // no document space.
+    CodeLinePosition? position(TextEditingValue native, int offset, int caret) {
+      if (offset < 0 || offset > native.text.length) {
+        return null;
+      }
+      final int prefix = native.startWithPrefix ? 1 : 0;
+      int index = selection.extentIndex;
+      final int localOffset = max(0, offset - prefix);
+      final int localCaret = max(0, caret - prefix);
+      int local = selection.extentOffset + localOffset - localCaret;
+      while (local < 0 && index > 0) {
+        local += codeLines[--index].length + 1;
+      }
+      while (local > codeLines[index].length && index + 1 < codeLines.length) {
+        local -= codeLines[index++].length + 1;
+      }
+      if (local < 0 || local > codeLines[index].length) {
+        return null;
+      }
+      return CodeLinePosition(index: index, offset: local);
+    }
+
+    CodeLineSelection? range(TextEditingValue native, int start, int end, int caret) {
+      final CodeLinePosition? base = position(native, start, caret);
+      final CodeLinePosition? extent = position(native, end, caret);
+      if (base == null || extent == null) {
+        return null;
+      }
+      return CodeLineSelection(
+        baseIndex: base.index,
+        baseOffset: base.offset,
+        extentIndex: extent.index,
+        extentOffset: extent.offset,
+        baseAffinity: native.selection.affinity,
+        extentAffinity: native.selection.affinity,
+      );
+    }
+
+    _applyingDeltaBatch = true;
+    try {
+      for (final TextEditingDelta delta in deltas) {
+        final TextEditingValue next = delta.apply(nativeValue);
+        bool command = _removesGuard(delta);
+        bool lineLocal = true;
+        if (command) {
+          final CodeLineSelection? target = range(nativeValue, 0, 0, nativeCaret);
+          if (target == null) {
+            break;
+          }
+          _controller.selection = target;
+          _controller.deleteBackward();
+        } else {
+          final int start;
+          final int end;
+          final String inserted;
+          if (delta is TextEditingDeltaInsertion) {
+            start = end = delta.insertionOffset;
+            inserted = delta.textInserted;
+          } else if (delta is TextEditingDeltaDeletion) {
+            start = delta.deletedRange.start;
+            end = delta.deletedRange.end;
+            inserted = '';
+          } else if (delta is TextEditingDeltaReplacement) {
+            start = delta.replacedRange.start;
+            end = delta.replacedRange.end;
+            inserted = delta.replacementText;
+          } else {
+            start = end = nativeValue.selection.extentOffset;
+            inserted = '';
+          }
+          final bool enter = delta is TextEditingDeltaInsertion && inserted == '\n' &&
+              start == nativeValue.selection.extentOffset && nativeValue.selection.isCollapsed &&
+              (!nativeValue.composing.isValid || nativeValue.composing.isCollapsed) &&
+              next.selection.isCollapsed && next.selection.extentOffset == start + 1 &&
+              (!next.composing.isValid || next.composing.isCollapsed);
+          final CodeLineSelection? target = range(nativeValue, start, end, nativeCaret);
+          // Reject an unmappable remainder and correct the native buffer once;
+          // clamping could silently insert text at an unrelated position.
+          if (target == null) {
+            break;
+          }
+          lineLocal = target.isSameLine && !inserted.isMultiline;
+          if (enter) {
+            command = true;
+            _controller.selection = target;
+            _controller.clearComposing();
+            _controller.applyNewLine();
+          } else if (delta is! TextEditingDeltaNonTextUpdate) {
+            // An IME may restore the guard before deleting it again. It is
+            // transport state, so never insert that leading guard as content.
+            final String replacement = start == 0 && inserted.startsWith(_kPrefix)
+                ? inserted.substring(1) : inserted;
+            _controller.replaceSelection(replacement, target);
+            nativeCaret = start + inserted.length;
+          }
+        }
+        if (command) {
+          nativeCaret = next.selection.extentOffset;
+        } else if (lineLocal) {
+          final CodeLineSelection? nextSelection = range(next,
+              next.selection.baseOffset, next.selection.extentOffset, nativeCaret);
+          if (nextSelection == null) {
+            break;
+          }
+          // An explicit selection delta navigates relative to the caret too.
+          // Text edits only restore line-local state; commands retain their
+          // own selection, even when they change the number of lines.
+          if (delta is TextEditingDeltaNonTextUpdate ||
+              (nextSelection.isSameLine && nextSelection.baseIndex == selection.baseIndex)) {
+            TextRange nextComposing = TextRange.empty;
+            if (next.composing.isValid) {
+              final CodeLineSelection? composing = range(next,
+                  next.composing.start, next.composing.end, nativeCaret);
+              if (composing != null && composing.baseIndex == nextSelection.baseIndex && composing.isSameLine) {
+                nextComposing = TextRange(start: composing.baseOffset, end: composing.extentOffset);
+              }
+            }
+            _controller.value = _controller.value.copyWith(
+              selection: nextSelection,
+              composing: nextComposing,
+            );
+            nativeCaret = next.selection.extentOffset;
+          }
+        }
+        nativeValue = next;
+      }
+      // Compare the one final push-back with the actual IME buffer, not with
+      // an intermediate line-local value that was never sent to the platform.
+      _remoteEditingValue = finalNativeValue;
+    } finally {
+      _applyingDeltaBatch = false;
+      _onCodeEditingChanged();
+    }
+    notifyListeners();
   }
 
   @override
