@@ -237,41 +237,38 @@ class _CodeInputController extends ChangeNotifier implements DeltaTextInputClien
 
   void _applyGuardedDeltaBatch(List<TextEditingDelta> deltas) {
     TextEditingValue nativeValue = _remoteEditingValue!;
-    int nativeCaret = nativeValue.selection.extentOffset;
     final TextEditingValue finalNativeValue = deltas.fold(nativeValue,
         (value, delta) => delta.apply(value));
+    final int prefix = nativeValue.startWithPrefix ? 1 : 0;
+    // Native offsets are UTF-16 boundaries. Keep both sides of each command:
+    // a newline may disappear (list exit) or expand into indentation and lines.
+    // A single caret-relative offset cannot represent either transformation.
+    // _buildTextEditingValue sends only the base line, including its guard.
+    List<CodeLinePosition> positions = List.generate(nativeValue.text.length + 1,
+        (offset) => CodeLinePosition(index: selection.baseIndex,
+            offset: max(0, offset - prefix)));
 
-    // Commands may remove a line or expand it into several lines. Anchor each
-    // native offset at the controller's current caret instead of assuming the
-    // native and document line counts still agree. The leading guard occupies
-    // no document space.
-    CodeLinePosition? position(TextEditingValue native, int offset, int caret) {
-      if (offset < 0 || offset > native.text.length) {
-        return null;
+    CodeLinePosition advance(CodeLinePosition start, String text, int offset) {
+      int index = start.index;
+      int column = start.offset;
+      for (int i = 0; i < offset; i++) {
+        final int unit = text.codeUnitAt(i);
+        if (unit == 13 || (unit == 10 && (i == 0 || text.codeUnitAt(i - 1) != 13))) {
+          index++;
+          column = 0;
+        } else if (unit != 10) {
+          column++;
+        }
       }
-      final int prefix = native.startWithPrefix ? 1 : 0;
-      int index = selection.extentIndex;
-      final int localOffset = max(0, offset - prefix);
-      final int localCaret = max(0, caret - prefix);
-      int local = selection.extentOffset + localOffset - localCaret;
-      while (local < 0 && index > 0) {
-        local += codeLines[--index].length + 1;
-      }
-      while (local > codeLines[index].length && index + 1 < codeLines.length) {
-        local -= codeLines[index++].length + 1;
-      }
-      if (local < 0 || local > codeLines[index].length) {
-        return null;
-      }
-      return CodeLinePosition(index: index, offset: local);
+      return CodeLinePosition(index: index, offset: column);
     }
 
-    CodeLineSelection? range(TextEditingValue native, int start, int end, int caret) {
-      final CodeLinePosition? base = position(native, start, caret);
-      final CodeLinePosition? extent = position(native, end, caret);
-      if (base == null || extent == null) {
+    CodeLineSelection? range(TextEditingValue native, int start, int end) {
+      if (start < 0 || end < 0 || start >= positions.length || end >= positions.length) {
         return null;
       }
+      final CodeLinePosition base = positions[start];
+      final CodeLinePosition extent = positions[end];
       return CodeLineSelection(
         baseIndex: base.index,
         baseOffset: base.offset,
@@ -282,19 +279,72 @@ class _CodeInputController extends ChangeNotifier implements DeltaTextInputClien
       );
     }
 
+    void remap(CodeLines previous, CodeLineSelection target) {
+      // These commands affect the target line, its previous line (backspace),
+      // and any newly created lines. Compare only that local window, using LF
+      // internally just as CodeLinePosition does, regardless of file endings.
+      final int lineDelta = codeLines.length - previous.length;
+      final int first = max(0, min(target.startIndex, selection.startIndex) - 1);
+      final int oldLast = max(target.endIndex, first - lineDelta);
+      final String oldText = previous.sublines(first, oldLast + 1).asString(TextLineBreak.lf, false);
+      final String newText = codeLines.sublines(first, oldLast + lineDelta + 1).asString(TextLineBreak.lf, false);
+      if (oldText == newText) {
+        return;
+      }
+      int relativeOffset(CodeLinePosition position) {
+        int offset = position.offset;
+        for (int index = first; index < position.index; index++) {
+          offset += previous[index].length + 1;
+        }
+        return offset;
+      }
+      // Repeated text must not move the inferred edit past its actual target.
+      final int prefixLimit = relativeOffset(target.start);
+      final int suffixLimit = oldText.length - relativeOffset(target.end);
+      int start = 0;
+      while (start < min(prefixLimit, min(oldText.length, newText.length)) &&
+          oldText.codeUnitAt(start) == newText.codeUnitAt(start)) {
+        start++;
+      }
+      int oldEnd = oldText.length;
+      int newEnd = newText.length;
+      while (oldText.length - oldEnd < suffixLimit && oldEnd > start && newEnd > start &&
+          oldText.codeUnitAt(oldEnd - 1) == newText.codeUnitAt(newEnd - 1)) {
+        oldEnd--;
+        newEnd--;
+      }
+      final CodeLinePosition origin = CodeLinePosition(index: first, offset: 0);
+      final CodeLinePosition from = advance(origin, oldText, start);
+      final CodeLinePosition to = advance(origin, oldText, oldEnd);
+      final CodeLinePosition replacementEnd = advance(origin, newText, newEnd);
+      positions = positions.map((position) {
+        if (!position.isAfter(from)) {
+          return position;
+        }
+        // Positions in removed text collapse to its replacement boundary.
+        if (!position.isAfter(to)) {
+          return replacementEnd;
+        }
+        return CodeLinePosition(
+          index: position.index + replacementEnd.index - to.index,
+          offset: position.index == to.index
+              ? replacementEnd.offset + position.offset - to.offset : position.offset,
+        );
+      }).toList();
+    }
+
     _applyingDeltaBatch = true;
     try {
       for (final TextEditingDelta delta in deltas) {
         final TextEditingValue next = delta.apply(nativeValue);
-        bool command = _removesGuard(delta);
-        bool lineLocal = true;
-        if (command) {
-          final CodeLineSelection? target = range(nativeValue, 0, 0, nativeCaret);
+        bool command = false;
+        if (delta is TextEditingDeltaNonTextUpdate) {
+          final CodeLineSelection? target = range(next,
+              next.selection.baseOffset, next.selection.extentOffset);
           if (target == null) {
             break;
           }
           _controller.selection = target;
-          _controller.deleteBackward();
         } else {
           final int start;
           final int end;
@@ -311,63 +361,78 @@ class _CodeInputController extends ChangeNotifier implements DeltaTextInputClien
             end = delta.replacedRange.end;
             inserted = delta.replacementText;
           } else {
-            start = end = nativeValue.selection.extentOffset;
-            inserted = '';
+            continue;
           }
+          final CodeLineSelection? target = range(nativeValue, start, end);
+          if (target == null) {
+            break;
+          }
+          final bool backspace = _removesGuard(delta);
           final bool enter = delta is TextEditingDeltaInsertion && inserted == '\n' &&
               start == nativeValue.selection.extentOffset && nativeValue.selection.isCollapsed &&
               (!nativeValue.composing.isValid || nativeValue.composing.isCollapsed) &&
               next.selection.isCollapsed && next.selection.extentOffset == start + 1 &&
               (!next.composing.isValid || next.composing.isCollapsed);
-          final CodeLineSelection? target = range(nativeValue, start, end, nativeCaret);
-          // Reject an unmappable remainder and correct the native buffer once;
-          // clamping could silently insert text at an unrelated position.
-          if (target == null) {
-            break;
-          }
-          lineLocal = target.isSameLine && !inserted.isMultiline;
-          if (enter) {
-            command = true;
+          command = backspace || enter;
+          final CodeLines previous = codeLines;
+          // A restored leading guard belongs to the input transport only.
+          final int guard = start == 0 && inserted.startsWith(_kPrefix) ? 1 : 0;
+          final String replacement = inserted.substring(guard);
+          if (backspace || enter) {
             _controller.selection = target;
             _controller.clearComposing();
-            _controller.applyNewLine();
-          } else if (delta is! TextEditingDeltaNonTextUpdate) {
-            // An IME may restore the guard before deleting it again. It is
-            // transport state, so never insert that leading guard as content.
-            final String replacement = start == 0 && inserted.startsWith(_kPrefix)
-                ? inserted.substring(1) : inserted;
+            if (backspace) {
+              _controller.deleteBackward();
+            } else {
+              _controller.applyNewLine();
+            }
+          } else {
             _controller.replaceSelection(replacement, target);
-            nativeCaret = start + inserted.length;
           }
-        }
-        if (command) {
-          nativeCaret = next.selection.extentOffset;
-        } else if (lineLocal) {
-          final CodeLineSelection? nextSelection = range(next,
-              next.selection.baseOffset, next.selection.extentOffset, nativeCaret);
-          if (nextSelection == null) {
-            break;
-          }
-          // An explicit selection delta navigates relative to the caret too.
-          // Text edits only restore line-local state; commands retain their
-          // own selection, even when they change the number of lines.
-          if (delta is TextEditingDeltaNonTextUpdate ||
-              (nextSelection.isSameLine && nextSelection.baseIndex == selection.baseIndex)) {
-            TextRange nextComposing = TextRange.empty;
-            if (next.composing.isValid) {
-              final CodeLineSelection? composing = range(next,
-                  next.composing.start, next.composing.end, nativeCaret);
-              if (composing != null && composing.baseIndex == nextSelection.baseIndex && composing.isSameLine) {
-                nextComposing = TextRange(start: composing.baseOffset, end: composing.extentOffset);
+          remap(previous, target);
+          final CodeLinePosition insertionStart = positions[start];
+          final CodeLinePosition caret = selection.extent;
+          final List<CodeLinePosition> insertedPositions = [];
+          int index = insertionStart.index;
+          int column = insertionStart.offset;
+          for (int i = 0; i < inserted.length; i++) {
+            if (i >= guard) {
+              final int unit = inserted.codeUnitAt(i);
+              if (unit == 13 || (unit == 10 && (i == guard || inserted.codeUnitAt(i - 1) != 13))) {
+                index++;
+                column = 0;
+              } else if (unit != 10) {
+                column++;
               }
             }
-            _controller.value = _controller.value.copyWith(
-              selection: nextSelection,
-              composing: nextComposing,
-            );
-            nativeCaret = next.selection.extentOffset;
+            insertedPositions.add(enter ? caret : CodeLinePosition(index: index, offset: column));
+          }
+          positions = [
+            ...positions.take(start),
+            backspace ? caret : insertionStart,
+            ...insertedPositions,
+            ...positions.skip(end + 1),
+          ];
+          // Commands own their caret (including generated indentation). Text
+          // edits and explicit navigation use the corresponding native boundary.
+          if (!backspace && !enter) {
+            final CodeLineSelection? nextSelection = range(next,
+                next.selection.baseOffset, next.selection.extentOffset);
+            if (nextSelection == null) {
+              break;
+            }
+            _controller.selection = nextSelection;
           }
         }
+        TextRange nextComposing = TextRange.empty;
+        if (!command && next.composing.isValid) {
+          final CodeLineSelection? composing = range(next,
+              next.composing.start, next.composing.end);
+          if (composing != null && composing.baseIndex == selection.baseIndex && composing.isSameLine) {
+            nextComposing = TextRange(start: composing.baseOffset, end: composing.extentOffset);
+          }
+        }
+        _controller.composing = nextComposing;
         nativeValue = next;
       }
       // Compare the one final push-back with the actual IME buffer, not with
