@@ -247,6 +247,10 @@ class _CodeInputController extends ChangeNotifier implements DeltaTextInputClien
     List<CodeLinePosition> positions = List.generate(nativeValue.text.length + 1,
         (offset) => CodeLinePosition(index: selection.baseIndex,
             offset: max(0, offset - prefix)));
+    // A line-local selection can be collapsed even when the document selects
+    // several lines. Keep that document range until the first edit consumes it
+    // or the input method explicitly moves the selection.
+    CodeLineSelection? documentSelection = selection.isSameLine ? null : selection;
 
     CodeLinePosition advance(CodeLinePosition start, String text, int offset) {
       int index = start.index;
@@ -339,13 +343,44 @@ class _CodeInputController extends ChangeNotifier implements DeltaTextInputClien
         final TextEditingValue next = delta.apply(nativeValue);
         bool command = false;
         if (delta is TextEditingDeltaNonTextUpdate) {
-          final CodeLineSelection? target = range(next,
-              next.selection.baseOffset, next.selection.extentOffset);
-          if (target == null) {
-            break;
+          if (documentSelection == null ||
+              next.selection.baseOffset != nativeValue.selection.baseOffset ||
+              next.selection.extentOffset != nativeValue.selection.extentOffset) {
+            documentSelection = null;
+            final CodeLineSelection? target = range(next,
+                next.selection.baseOffset, next.selection.extentOffset);
+            if (target == null) {
+              break;
+            }
+            _controller.selection = target;
           }
-          _controller.selection = target;
         } else {
+          final bool backspace = _removesGuard(delta);
+          if (documentSelection != null && !backspace) {
+            // Reuse the ordinary edit path's cross-line replacement semantics.
+            // For a reverse selection it retains the unselected starting prefix.
+            int index = documentSelection.startIndex;
+            int column = documentSelection.baseIndex > documentSelection.extentIndex
+                ? documentSelection.startOffset : 0;
+            _controller.edit(next.removePrefixIfNecessary());
+            final int guard = next.startWithPrefix ? 1 : 0;
+            positions = [CodeLinePosition(index: index, offset: column)];
+            for (int i = 0; i < next.text.length; i++) {
+              if (i >= guard) {
+                final int unit = next.text.codeUnitAt(i);
+                if (unit == 13 || (unit == 10 && (i == guard || next.text.codeUnitAt(i - 1) != 13))) {
+                  index++;
+                  column = 0;
+                } else if (unit != 10) {
+                  column++;
+                }
+              }
+              positions.add(CodeLinePosition(index: index, offset: column));
+            }
+            documentSelection = null;
+            nativeValue = next;
+            continue;
+          }
           final int start;
           final int end;
           final String inserted;
@@ -363,11 +398,11 @@ class _CodeInputController extends ChangeNotifier implements DeltaTextInputClien
           } else {
             continue;
           }
-          final CodeLineSelection? target = range(nativeValue, start, end);
+          final CodeLineSelection? target = documentSelection ?? range(nativeValue, start, end);
           if (target == null) {
             break;
           }
-          final bool backspace = _removesGuard(delta);
+          documentSelection = null;
           final bool enter = delta is TextEditingDeltaInsertion && inserted == '\n' &&
               start == nativeValue.selection.extentOffset && nativeValue.selection.isCollapsed &&
               (!nativeValue.composing.isValid || nativeValue.composing.isCollapsed) &&
